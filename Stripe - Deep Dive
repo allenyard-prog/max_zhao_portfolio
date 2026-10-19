@@ -1,0 +1,1132 @@
+# Stripe Billing — Product Catalog & Usage-Based Billing
+
+## Overall Role and Context
+
+I worked as a **Senior Full-Stack Engineer within Stripe Billing**, primarily across the **Usage-Based Billing** and **Product Catalog & Pricing** domains.
+
+My work focused on three major areas:
+
+1. **Meter Event Ingestion** — accepting very high volumes of customer usage data reliably.
+2. **Stream Processing & Metering** — processing, reconciling, and aggregating usage events into billable quantities.
+3. **Flexible Pricing & Rate Cards** — allowing businesses to configure flat-rate, tiered, usage-based, and hybrid pricing without custom billing implementations.
+
+These systems were part of a broader billing lifecycle:
+
+```text
+Product Catalog
+      │
+      ▼
+Pricing / Rate Cards
+      │
+      ▼
+Customer Subscription / Contract
+      │
+      │
+Usage Events
+      ▼
+Meter Event Ingestion
+      │
+      ▼
+Event Stream
+      │
+      ▼
+Stream Processing
+      │
+      ▼
+Usage Aggregation
+      │
+      ▼
+Rating / Pricing
+      │
+      ▼
+Invoice Line Items
+      │
+      ▼
+Invoice → Payment → Revenue
+```
+
+I collaborated closely with **product managers, engineering managers, product designers, infrastructure/platform engineers, SREs, data engineers, and engineers responsible for subscriptions, invoicing, payments, credits, and revenue systems**.
+
+The main architectural goal was to separate **high-volume usage collection** from **financially authoritative billing**, allowing each layer to scale independently while preserving the correctness expected from a financial platform.
+
+Stripe has publicly described a similar high-level architecture for Usage-Based Billing: stateless event ingestion into an event bus, Apache Flink-based processing, active-active regional processing, and separate fast and authoritative aggregation paths. Stripe reports supporting up to **100,000 usage events per second per business** in this architecture.
+
+
+# Project 1 — Meter Event Ingestion Service
+
+## Business Context and Strategic Motivation
+
+Usage-based pricing became increasingly important as SaaS, infrastructure, and AI companies moved away from purely fixed subscriptions.
+
+Instead of charging:
+
+```text
+Pro Plan
+$99 / month
+```
+
+businesses increasingly needed to charge for things such as:
+
+```text
+API requests
+AI tokens
+GPU seconds
+Compute hours
+Storage consumed
+Messages processed
+Successful transactions
+```
+
+This changes the scale of Billing dramatically.
+
+A subscription might generate one billing operation per month, while an AI customer can generate **millions or billions of usage events** during the same period.
+
+The existing synchronous API pattern was not ideal for that workload because each request could require authentication, routing, RPC calls, business validation, and database access before responding.
+
+The objective of the project was therefore to create an ingestion layer that could:
+
+- accept extremely high event volumes;
+- respond quickly to clients;
+- isolate downstream failures from producers;
+- prevent data loss;
+- support retries and deduplication;
+- evolve event schemas safely;
+- protect the platform from abusive or noisy tenants.
+
+Stripe publicly describes the same strategic problem: its second-generation UBB API was designed to increase throughput roughly **100×**, using stateless validation at the edge followed by asynchronous processing through an event bus.
+
+
+## My Role
+
+I owned a significant portion of the design and implementation of the **Meter Event Ingestion Service**.
+
+My responsibilities included:
+
+- defining ingestion API contracts;
+- designing asynchronous event routing;
+- establishing schema and validation rules;
+- implementing batching and backpressure controls;
+- defining idempotency and deduplication strategies;
+- working with the stream-processing team on the event contract;
+- defining SLIs/SLOs for ingestion;
+- coordinating rollout and compatibility with existing Billing APIs;
+- working with Dashboard/API teams on asynchronous failure visibility.
+
+The core implementation stack was:
+
+```text
+Go
+Kafka
+Protobuf
+gRPC
+```
+
+Go was used for the high-concurrency stateless service layer, while Protobuf provided a strongly typed event contract. Kafka acted as the durable asynchronous boundary between ingestion and processing. gRPC was primarily appropriate for internal service communication rather than as a requirement for the public-facing API.
+
+
+## Overall Architecture
+
+```text
+Customer / SDK
+      │
+      │ Meter Event
+      ▼
+┌───────────────────────┐
+│ API / Edge Layer      │
+│                       │
+│ Authentication        │
+│ Rate limiting         │
+│ Basic validation      │
+└──────────┬────────────┘
+           ▼
+┌───────────────────────┐
+│ Meter Event Ingestion │
+│ Go                    │
+│                       │
+│ Schema validation     │
+│ Tenant resolution     │
+│ Event ID assignment   │
+│ Metadata enrichment   │
+│ Batching              │
+└──────────┬────────────┘
+           │
+        Protobuf
+           │
+           ▼
+┌───────────────────────┐
+│ Kafka / Event Bus     │
+│                       │
+│ Durable               │
+│ Partitioned           │
+│ Replayable            │
+└──────────┬────────────┘
+           │
+           ▼
+    Stream Processing
+```
+
+A typical normalized event looked conceptually like:
+
+```text
+event_id
+account_id
+customer_id
+meter_id
+timestamp
+quantity
+dimensions
+event_type
+source
+schema_version
+```
+
+The ingestion service deliberately performed only the validation required to determine whether an event was structurally acceptable.
+
+It did **not** perform rating, invoice generation, or complex billing calculations synchronously.
+
+
+## Major Architecture Tradeoffs
+
+### Asynchronous vs. synchronous processing
+
+The most important decision was to acknowledge the event quickly and move expensive processing downstream.
+
+Synchronous processing gives customers immediate knowledge of final processing success, but at very high traffic it couples API latency and availability to every downstream billing dependency.
+
+We preferred:
+
+```text
+Authenticate
+     ↓
+Validate structure
+     ↓
+Persist to event stream
+     ↓
+Acknowledge
+```
+
+rather than:
+
+```text
+Authenticate
+ ↓
+Validate
+ ↓
+Look up customer
+ ↓
+Look up subscription
+ ↓
+Aggregate usage
+ ↓
+Evaluate pricing
+ ↓
+Persist financial state
+ ↓
+Respond
+```
+
+The tradeoff was that asynchronous processing required much better **developer observability**.
+
+An event could be successfully accepted but later fail semantic validation.
+
+That meant we needed event status visibility, structured error reporting, metrics, and asynchronous notifications.
+
+Stripe publicly called out exactly this tradeoff when describing its UBB architecture.
+
+
+### Kafka partitioning
+
+Partitioning was important because we needed both high parallelism and predictable processing locality.
+
+Potential keys included:
+
+```text
+account_id
+customer_id
+meter_id
+account_id + customer_id
+```
+
+Using only account ID preserved locality but could create very hot partitions for large customers.
+
+Using a highly distributed key improved throughput but made downstream customer-level aggregation harder.
+
+The design therefore had to balance:
+
+**ordering requirements + partition distribution + downstream aggregation cost.**
+
+
+### At-least-once delivery vs. exactly-once business semantics
+
+Rather than assuming every distributed component could guarantee global exactly-once behavior, we designed downstream processing to tolerate event replay.
+
+Unique event identifiers, idempotent state transitions, and deterministic aggregation were more robust than relying solely on transport-level guarantees.
+
+
+## Delivery
+
+I would describe the project delivery in four stages.
+
+**Phase 1 — API and event contract**
+
+We established the canonical meter-event schema, validation rules, versioning model, and compatibility requirements between producers and downstream consumers.
+
+**Phase 2 — asynchronous ingestion**
+
+We introduced the stateless ingestion path and event-bus integration while keeping downstream billing behavior unchanged.
+
+**Phase 3 — scale and reliability**
+
+We load-tested burst traffic, introduced partitioning and backpressure strategies, added rate limits and tenant isolation, and tested replay and failure scenarios.
+
+**Phase 4 — controlled rollout**
+
+We gradually migrated traffic through feature flags/canaries, monitored ingestion latency and downstream error rates, and maintained rollback paths before increasing adoption.
+
+
+## Success Metrics
+
+The strongest metrics for this project would be:
+
+```text
+Peak sustainable events/sec
+P95/P99 ingestion latency
+API availability
+Event-loss rate
+Duplicate-event rate
+Invalid-event rate
+Kafka publish latency
+Backpressure frequency
+Cost per million events
+Downstream processing lag
+```
+
+For an interview, I would use personally verified project numbers.
+
+As broader Stripe platform context—not as a personal accomplishment—Stripe publicly reported a UBB capability of **100,000 events/sec per business**, a target of **99.999% availability**, and zero-data-loss requirements for the redesign.
+
+
+## Most Technically Challenging Part
+
+The hardest problem was not simply handling a high number of HTTP requests.
+
+The real challenge was preserving **financial reliability while decoupling ingestion from processing**.
+
+Once a customer receives a successful acknowledgment, losing that usage event can eventually translate directly into incorrect revenue.
+
+We therefore had to reason carefully about:
+
+```text
+API acknowledgement
+        ↓
+durable persistence boundary
+        ↓
+retries
+        ↓
+duplicate events
+        ↓
+stream replay
+        ↓
+event ordering
+        ↓
+billing correctness
+```
+
+Multi-tenant load was another major challenge because a single large AI or infrastructure customer could generate orders of magnitude more traffic than the typical merchant.
+
+
+## What I Learned / What I Would Do Differently
+
+The biggest lesson was that an asynchronous API cannot be treated as merely a faster synchronous API.
+
+It needs a first-class operational experience.
+
+If I were designing it again, I would invest earlier in:
+
+- event tracing from ingestion through aggregation;
+- merchant-visible processing states;
+- standardized rejection reason codes;
+- per-account lag and throughput dashboards;
+- replay tooling;
+- automated hot-partition detection.
+
+I would also define the durability boundary and idempotency semantics extremely early because those decisions affect almost every downstream service.
+
+
+---
+
+# Project 2 — Stream Processing Service
+
+## Business Context and Strategic Motivation
+
+Once the system could ingest extremely high event volumes, the next challenge was converting those events into trustworthy usage data.
+
+Meter events can arrive:
+
+```text
+late
+duplicated
+out of order
+replayed
+after temporary failures
+from multiple geographic regions
+```
+
+A normal analytics pipeline can often tolerate some delay or inconsistency.
+
+A billing pipeline cannot.
+
+If we aggregate incorrectly:
+
+```text
+Actual usage       10,000,000 units
+
+Calculated usage    9,700,000 units
+```
+
+we may underbill.
+
+If we process an event twice:
+
+```text
+Actual usage       10,000,000 units
+
+Calculated usage   10,300,000 units
+```
+
+we may overbill.
+
+Both outcomes damage customer trust.
+
+The objective was to create a distributed stream-processing layer that could provide both **low-latency usage visibility** and **financially reliable authoritative results**.
+
+
+## My Role
+
+I worked on the design and implementation of the distributed processing pipeline using:
+
+```text
+Java
+Apache Flink
+Kafka
+RocksDB
+```
+
+My ownership included:
+
+- Flink job design;
+- event-time and watermark strategy;
+- stateful processing;
+- checkpoint and recovery behavior;
+- late-event handling;
+- partition/key design;
+- replay behavior;
+- operational metrics;
+- integration with ingestion and aggregation services;
+- failure testing;
+- production rollout.
+
+I worked particularly closely with engineers responsible for ingestion, billing aggregation, alerts/credits, invoicing, infrastructure, and reliability.
+
+
+## Overall Architecture
+
+```text
+                  Kafka
+                    │
+                    ▼
+          ┌───────────────────┐
+          │ Apache Flink      │
+          │ Java              │
+          │                   │
+          │ Deserialize       │
+          │ Normalize         │
+          │ Deduplicate       │
+          │ Assign event time │
+          │ Enrich            │
+          │ Partition         │
+          └─────────┬─────────┘
+                    │
+             Stateful processing
+                    │
+                    ▼
+                 RocksDB
+                    │
+          ┌─────────┴───────────┐
+          │                     │
+          ▼                     ▼
+      Fast Path          Authoritative Path
+          │                     │
+   near-real-time            durable
+      aggregates            aggregation
+          │                     │
+          ▼                     ▼
+ Alerts / balance       Rating / invoicing
+ visibility             financial records
+```
+
+Stripe publicly describes a similar dual-path model.
+
+Its fast pipeline uses approximately **30-second tumbling windows** for time-sensitive functionality such as alerts and credit balances.
+
+Its slower path uses approximately **five-minute windows**, writes events durably, and handles delayed/out-of-order events before producing invoicing, analytics, and financial data.
+
+
+## Why Apache Flink
+
+Flink was particularly well suited because the problem required more than basic message consumption.
+
+We needed:
+
+```text
+event-time semantics
+stateful transformations
+distributed checkpoints
+large keyed state
+watermarks
+windowing
+failure recovery
+horizontal scaling
+```
+
+A simplified pipeline was:
+
+```text
+Kafka Source
+    ↓
+deserialize
+    ↓
+assign timestamp / watermark
+    ↓
+keyBy(account, customer, meter)
+    ↓
+deduplicate
+    ↓
+stateful processing
+    ↓
+window / aggregate
+    ↓
+downstream sink
+```
+
+RocksDB provided a practical state backend for large keyed state that could not safely remain entirely on the JVM heap.
+
+
+## Major Architecture Tradeoffs
+
+### Processing time vs. event time
+
+Processing time is simpler:
+
+```text
+process event when server receives it
+```
+
+but usage events can arrive late.
+
+For example:
+
+```text
+Event timestamp     10:00:01
+Arrival time         10:08:42
+```
+
+For billing, the event usually needs to belong to the billing period corresponding to **10:00:01**, not 10:08:42.
+
+We therefore favored event-time semantics.
+
+The downside is considerably more complexity around watermarks and how long to wait for delayed events.
+
+
+### Fast results vs. authoritative results
+
+One pipeline cannot optimize perfectly for both.
+
+Customers want usage dashboards and credit alerts quickly.
+
+Financial systems want maximum correctness.
+
+We therefore conceptually separated:
+
+```text
+FAST
+
+short windows
+low latency
+alerts
+usage visibility
+```
+
+from:
+
+```text
+AUTHORITATIVE
+
+longer reconciliation window
+durable state
+late-event handling
+invoice correctness
+```
+
+Trying to force financial finality into the low-latency path would either increase latency or make edge cases harder to handle.
+
+
+### Large state vs. memory performance
+
+Keeping state entirely in memory is fast, but a billing system can maintain state across:
+
+```text
+millions of customers
+×
+multiple meters
+×
+billing periods
+×
+pricing dimensions
+```
+
+That can create enormous state.
+
+RocksDB introduced additional local I/O and operational complexity but provided a much safer scaling model for large keyed state.
+
+
+## Delivery
+
+**Phase 1 — baseline Flink pipeline**
+
+We built ingestion-to-processing integration and established the basic event contract.
+
+**Phase 2 — state and event time**
+
+We introduced keyed state, event timestamps, watermarks, deduplication, and late-event handling.
+
+**Phase 3 — resilience**
+
+We tested worker failures, Kafka rebalances, checkpoint restoration, poison events, replay, and regional degradation.
+
+**Phase 4 — production migration**
+
+Rather than immediately replacing existing results, the new pipeline could run in shadow mode and compare outputs against the existing source of truth.
+
+Differences were categorized and reconciled before progressively moving production consumers.
+
+
+## Success Metrics
+
+Metrics I would expect to track include:
+
+```text
+Events processed/sec
+P95 event-processing latency
+Consumer lag
+Checkpoint duration
+Checkpoint failure rate
+State size
+Recovery time
+Late-event percentage
+Duplicate percentage
+Fast vs authoritative aggregate divergence
+Regional reconciliation discrepancies
+End-to-end usage-to-rated-output latency
+```
+
+Stripe publicly reports **P95 latency below 30 seconds for time-sensitive UBB operations** and approximately **five minutes from ingestion to rated output for most use cases**. These are useful platform benchmarks but should not be presented as personal metrics unless they were directly tied to your work.
+
+
+## Most Technically Challenging Part
+
+The hardest technical problem was **distributed state correctness under failure**.
+
+An event can be:
+
+```text
+read from Kafka
+       ↓
+state updated
+       ↓
+worker crashes
+       ↓
+checkpoint restored
+       ↓
+event replayed
+```
+
+If the pipeline is not designed correctly, the same usage can be counted twice.
+
+We had to understand the relationship between:
+
+```text
+Kafka offsets
+Flink checkpoints
+RocksDB state
+sink commits
+replay semantics
+```
+
+Another difficult problem was late data.
+
+A billing platform cannot simply discard an event because it arrived outside a normal analytics window.
+
+The architecture needed controlled mechanisms to incorporate delayed events while still eventually finalizing invoiceable usage.
+
+
+## What I Learned / What I Would Do Differently
+
+The biggest lesson was that streaming correctness is largely about **state management**, not message transport.
+
+If I revisited the project, I would:
+
+- establish replay as a first-class production workflow earlier;
+- build automated aggregate comparison tooling from the beginning;
+- create clearer state-size budgets per meter/customer;
+- instrument checkpoint health more aggressively;
+- define explicit lateness policies by use case rather than applying one universal watermark strategy.
+
+I would also separate the operational expectations of the fast and authoritative paths earlier so teams would not accidentally treat near-real-time state as financially final.
+
+
+---
+
+# Project 3 — Flexible Pricing & Rate Card Service
+
+## Business Context and Strategic Motivation
+
+The metering system answers:
+
+> **How much did the customer use?**
+
+The pricing system answers:
+
+> **What should that usage cost?**
+
+Modern SaaS and AI companies increasingly need more than a simple monthly subscription.
+
+They might combine:
+
+```text
+$1,000 monthly platform fee
+
++
+
+$20 per seat
+
++
+
+10 million included tokens
+
++
+
+$0.001 per additional token
+
++
+
+volume discount above 100M tokens
+```
+
+Enterprise customers might additionally negotiate:
+
+```text
+custom rate
+minimum commitment
+special tier
+effective date
+customer-specific discount
+```
+
+Historically, companies often implemented this logic directly in application code.
+
+That makes pricing changes slow and risky because every new business model requires engineering work.
+
+The strategic goal of the Flexible Pricing and Rate Card project was to turn pricing into **configuration rather than custom code**.
+
+This aligns with Stripe's current Billing strategy. Stripe now emphasizes usage/hybrid models, multidimensional pricing, commits, bespoke contracts, and increasingly large product catalogs through Stripe Billing and Metronome.
+
+
+## My Role
+
+I worked as a senior full-stack engineer across both the merchant-facing experience and pricing backend.
+
+The primary stack was:
+
+```text
+Ruby on Rails
+PostgreSQL
+React
+TypeScript
+```
+
+I owned or contributed to:
+
+- pricing/rate-card domain modeling;
+- API design;
+- pricing versioning;
+- effective dates;
+- validation rules;
+- pricing preview;
+- React pricing configuration flows;
+- migration of existing price configurations;
+- integration with metering/rating systems;
+- testing and rollout.
+
+I partnered closely with product management and design because pricing configuration is both a technical and UX problem.
+
+I also worked with Subscription, Usage Billing, Invoice, Contracts, and Revenue teams because pricing definitions ultimately affect all of those systems.
+
+
+## Overall Architecture
+
+```text
+                 Stripe Dashboard
+                       │
+                 React / TypeScript
+                       │
+                       ▼
+              Pricing Configuration API
+                       │
+                 Ruby on Rails
+                       │
+        ┌──────────────┼──────────────┐
+        ▼              ▼              ▼
+     Product         Price        Rate Card
+        │              │              │
+        │         Price Version       │
+        │              │              │
+        └──────────────┼──────────────┘
+                       ▼
+                   PostgreSQL
+                       │
+                       │ published configuration
+                       ▼
+                 Pricing / Rating
+                       ▲
+                       │
+                Aggregated Usage
+                       │
+                  Metering System
+```
+
+Conceptually:
+
+```text
+Product
+   │
+   ├── Flat Rate
+   │
+   ├── Per Unit
+   │
+   ├── Tiered
+   │
+   ├── Usage Based
+   │
+   └── Hybrid
+```
+
+Stripe's public Billing model similarly separates **Products**, which represent what a merchant sells, from **Prices**, which describe how and how often the customer is charged. Stripe documents flat-rate, per-seat, tiered, and usage-based pricing models.
+
+
+## Rate Card Model
+
+A rate card could conceptually represent:
+
+```text
+AI Platform Rate Card
+Version 4
+Effective: Oct 1
+
+Base platform fee:
+$1,000 / month
+
+Inference API:
+0–1M          $0.010/request
+1M–10M        $0.008/request
+10M+          $0.005/request
+
+Storage:
+$0.02 / GB-month
+```
+
+Instead of hardcoding this logic into the invoice system, the rating layer reads the applicable immutable pricing version.
+
+This creates a clean separation:
+
+```text
+Product Catalog
+"What are we selling?"
+
+Pricing
+"How do we charge for it?"
+
+Metering
+"How much did the customer consume?"
+
+Rating
+"How much money does that usage represent?"
+
+Invoicing
+"What should appear on the bill?"
+```
+
+
+## Major Architecture Tradeoffs
+
+### Mutable prices vs. immutable versions
+
+Allowing users to simply edit an existing rate looks easy.
+
+But consider:
+
+```text
+January
+$0.01/request
+
+March
+changed to
+$0.008/request
+```
+
+If the same record is overwritten, historical billing can become impossible to explain.
+
+We therefore favored effectively immutable pricing versions with explicit effective dates.
+
+```text
+Rate Card v1
+Jan 1 → Feb 29
+
+Rate Card v2
+Mar 1 →
+```
+
+The downside was more complex storage and querying.
+
+The upside was much stronger auditability, reproducibility, rollback capability, and historical correctness.
+
+
+### Generic rule engine vs. typed pricing models
+
+A completely generic pricing language offers maximum flexibility:
+
+```text
+if X and Y and Z...
+```
+
+but it becomes hard to validate, optimize, explain, and expose safely through a merchant UI.
+
+Instead, the system modeled common pricing primitives explicitly:
+
+```text
+flat
+per-unit
+volume tier
+graduated tier
+usage
+fixed fee + overage
+```
+
+That reduced theoretical flexibility but improved safety and usability.
+
+
+### Flexibility vs. merchant UX
+
+Backend engineers can easily represent deeply nested pricing rules.
+
+That doesn't mean merchants can configure them correctly.
+
+A major full-stack challenge was designing the UI so that users understood:
+
+```text
+What quantity is being measured?
+
+When does the price apply?
+
+Are tiers graduated or volume based?
+
+What happens above the included amount?
+
+When does the new version become effective?
+```
+
+The solution required inline validation, contextual help, previews, and explicit summaries before publishing.
+
+
+## Delivery
+
+**Phase 1 — domain model**
+
+We formalized the concepts of price, rate card, pricing model, version, effective period, tier, and usage meter relationship.
+
+**Phase 2 — API**
+
+We built versioned APIs for creating, validating, previewing, and publishing pricing configurations.
+
+**Phase 3 — merchant experience**
+
+We built React/TypeScript workflows for creating and editing pricing models with immediate validation.
+
+**Phase 4 — pricing preview**
+
+Before publishing, merchants could preview how example quantities would be priced.
+
+For example:
+
+```text
+Input:
+1,250,000 API calls
+
+Preview:
+
+First 1M     → $10,000
+Next 250K    → $2,000
+
+Total        → $12,000
+```
+
+This was valuable for catching configuration errors before they became billing errors.
+
+**Phase 5 — migration and rollout**
+
+Existing pricing models needed backward compatibility.
+
+We gradually introduced the new configuration model, converted eligible existing prices, and kept rollback/audit paths available.
+
+
+## Success Metrics
+
+Useful project metrics included:
+
+```text
+Pricing configuration completion rate
+Median time to create a pricing model
+Pricing validation failure rate
+Preview-to-publish conversion
+Pricing-related support incidents
+Pricing-related billing corrections
+API latency
+Rate-card evaluation latency
+Adoption of usage/hybrid pricing
+Number of pricing changes requiring engineering support
+Time required to launch a new pricing model
+```
+
+The strongest business metric was reducing the amount of custom engineering required for merchants to introduce or modify monetization models.
+
+That matters increasingly because Stripe reports that hybrid pricing adoption has grown materially among scaling businesses, while its 2026 Billing strategy emphasizes faster pricing iteration, commits, multidimensional pricing, and bespoke enterprise contracts.
+
+
+## Most Technically Challenging Part
+
+The most difficult problem was maintaining **pricing flexibility without sacrificing financial reproducibility**.
+
+Given an invoice from six months ago, the system needs to answer:
+
+```text
+Which product?
+Which rate card?
+Which rate-card version?
+Which meter?
+Which usage quantity?
+Which tier?
+Which effective date?
+Which customer override?
+Why was this exact amount charged?
+```
+
+That meant pricing configuration could not behave like ordinary CRUD data.
+
+It needed the properties of a financial configuration system:
+
+```text
+versioned
+effective-dated
+auditable
+deterministic
+reproducible
+```
+
+Another major challenge was coordinating frontend flexibility with backend validation.
+
+The UI had to prevent configuration states that were syntactically possible but financially ambiguous.
+
+
+## What I Learned / What I Would Do Differently
+
+The biggest lesson was that pricing infrastructure should be designed as a **domain platform**, not simply a collection of database tables and forms.
+
+If I rebuilt the system, I would invest earlier in a shared pricing representation used consistently by:
+
+```text
+Dashboard
+API
+validation
+preview
+rating
+invoice explanation
+testing
+```
+
+That prevents the frontend preview and backend rating engine from independently implementing slightly different interpretations of the same pricing model.
+
+I would also invest earlier in:
+
+- pricing simulation;
+- historical replay;
+- structured audit diffs;
+- bulk price migration tooling;
+- customer-specific pricing previews;
+- automated compatibility checks before publication.
+
+
+# How the Three Projects Fit Together
+
+The three projects were not independent.
+
+They represented different stages of one billing pipeline:
+
+```text
+                 PRODUCT CATALOG
+                       │
+                       ▼
+             FLEXIBLE PRICING
+                & RATE CARDS
+                       │
+                       │
+                       ▼
+                 Rating Engine
+                       ▲
+                       │
+               Aggregated Usage
+                       ▲
+                       │
+             STREAM PROCESSING
+                       ▲
+                       │
+               Usage Event Bus
+                       ▲
+                       │
+             METER EVENT INGESTION
+                       ▲
+                       │
+                 Customer Usage
+```
+
+The **Meter Event Ingestion Service** optimized for throughput and durability.
+
+The **Stream Processing Service** optimized for distributed-state correctness, event-time processing, and recoverability.
+
+The **Flexible Pricing and Rate Card Service** optimized for configuration flexibility, auditability, and financial reproducibility.
+
+Together, they enabled the larger business objective:
+
+> Allow SaaS, AI, and enterprise businesses to send extremely large volumes of usage data, transform that data into reliable billable quantities, and monetize it using flexible pricing models without building their own billing infrastructure.
+
+
+# Concise Interview Narrative
+
+If I needed to summarize the entire experience in two minutes, I would say:
+
+I worked primarily across Stripe Billing's Product Catalog and Usage-Based Billing domains. The broader problem was that modern SaaS and AI businesses were moving toward consumption and hybrid pricing, which meant Billing needed to handle dramatically more usage data and much more flexible pricing.
+
+On the usage side, I worked on a high-throughput ingestion layer that accepted meter events asynchronously and decoupled producers from downstream billing processing. Those events flowed into a Java/Flink stream-processing pipeline that handled event time, large keyed state, late events, recovery, and aggregation before producing authoritative usage for rating and invoicing.
+
+On the pricing side, I worked on a full-stack flexible pricing and rate-card platform using Rails, PostgreSQL, React, and TypeScript. We treated pricing configurations as versioned, effective-dated financial objects instead of mutable CRUD records so that historical bills remained reproducible.
+
+The biggest architectural theme across all three projects was separating systems according to their requirements: ingestion optimized for throughput, stream processing optimized for correctness and recoverability, and pricing optimized for flexibility and auditability. That separation allowed each layer to scale independently without compromising billing accuracy.
