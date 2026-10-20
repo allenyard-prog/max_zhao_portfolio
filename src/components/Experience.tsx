@@ -1,6 +1,7 @@
 import { useRef } from 'react'
 import { gsap, useGSAP, SplitText } from '../lib/gsap'
 import { experience } from '../data/content'
+import { CompanyMark } from './BrandIcon'
 
 export default function Experience() {
   const root = useRef<HTMLElement>(null)
@@ -38,7 +39,8 @@ export default function Experience() {
               scrollTrigger: { trigger: item, start: 'top 75%' },
             })
             intro
-              .from(split.chars, { yPercent: 110, stagger: 0.03, duration: d(1.1) })
+              .from(item.querySelector('.exp__logo'), { scale: 0.6, autoAlpha: 0, rotate: -12, duration: d(1), ease: 'back.out(1.8)' })
+              .from(split.chars, { yPercent: 110, stagger: 0.03, duration: d(1.1) }, '-=0.7')
               .from(
                 item.querySelectorAll('.exp__title, .exp__period, .exp__tagline'),
                 { y: 20, autoAlpha: 0, stagger: 0.08, duration: d(1) },
@@ -103,6 +105,9 @@ export default function Experience() {
         {experience.map((job) => (
           <article className="exp__item" key={job.company}>
             <div className="exp__left">
+              <div className="exp__logo">
+                <CompanyMark company={job.company} size={56} />
+              </div>
               <h3 className="exp__company line-mask">{job.company}</h3>
               <div className="exp__title">{job.title}</div>
               <div className="exp__period">{job.period}</div>

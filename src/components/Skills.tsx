@@ -58,7 +58,7 @@ export default function Skills() {
     <section className="section skills" id="skills" ref={root}>
       <div className="container">
         <div className="section-head">
-          <span className="eyebrow">04 — Skills</span>
+          <span className="eyebrow">05 — Skills</span>
           <h2 className="h2">
             Full stack, <em className="grad-text">end to end</em>
           </h2>

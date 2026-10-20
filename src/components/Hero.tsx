@@ -2,6 +2,7 @@ import { useRef } from 'react'
 import { gsap, useGSAP, SplitText } from '../lib/gsap'
 import { profile } from '../data/content'
 import MagneticButton from './MagneticButton'
+import { StripeMark, AmazonMark } from './BrandIcon'
 
 type Props = { ready: boolean; onNavigate: (target: string | number) => void }
 
@@ -95,7 +96,9 @@ export default function Hero({ ready, onNavigate }: Props) {
             <span className="dot" /> Available for senior roles
           </span>
           <span className="hero__meta-item">{profile.location}</span>
-          <span className="hero__meta-item">Stripe · ex-Amazon</span>
+          <span className="hero__meta-item hero__meta-item--brands">
+            <StripeMark size={18} /> Stripe <span className="sep">·</span> <AmazonMark size={18} /> ex-Amazon
+          </span>
         </div>
 
         <h1 className="hero__title" aria-label={`${profile.name}, ${profile.role}`}>
@@ -115,11 +118,17 @@ export default function Hero({ ready, onNavigate }: Props) {
             platforms — plus the AI agents that operate them.
           </p>
           <div className="hero__roles">
-            <span>
-              <strong>Stripe</strong> — Senior Software Engineer, 2021 → now
+            <span className="with-brand">
+              <StripeMark size={20} />
+              <span>
+                <strong>Stripe</strong> — Senior Software Engineer, 2021 → now
+              </span>
             </span>
-            <span>
-              <strong>Amazon</strong> — Software Engineer, 2019 → 2021
+            <span className="with-brand">
+              <AmazonMark size={20} />
+              <span>
+                <strong>Amazon</strong> — Software Engineer, 2019 → 2021
+              </span>
             </span>
             <div className="btn-row" style={{ marginTop: '1.25rem' }}>
               <MagneticButton href="#work" variant="primary" onClick={(e) => { e.preventDefault(); onNavigate('#work') }}>

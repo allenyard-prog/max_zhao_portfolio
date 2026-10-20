@@ -20,7 +20,7 @@ export const profile = {
 export const stats = [
   { value: 7, suffix: '+', label: 'Years shipping production software' },
   { value: 2, suffix: '', label: 'Scale-defining companies' },
-  { value: 8, suffix: '', label: 'Languages & runtimes in production' },
+  { value: 7, suffix: '', label: 'Programming languages in production' },
   { value: 40, suffix: '+', label: 'Technologies across the stack' },
 ]
 

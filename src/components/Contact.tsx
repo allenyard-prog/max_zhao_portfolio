@@ -58,7 +58,7 @@ export default function Contact({ onNavigate }: Props) {
       <div className="contact__glow" aria-hidden="true" />
       <div className="container">
         <div className="contact__inner">
-          <span className="eyebrow">05 — Contact</span>
+          <span className="eyebrow">06 — Contact</span>
           <h2 className="contact__title">
             <span className="line-mask">
               <span className="line line--plain">Let's build something</span>

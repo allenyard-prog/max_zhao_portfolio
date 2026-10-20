@@ -4,8 +4,10 @@ import { ScrollTrigger } from 'gsap/ScrollTrigger'
 import { ScrollSmoother } from 'gsap/ScrollSmoother'
 import { SplitText } from 'gsap/SplitText'
 import { ScrollToPlugin } from 'gsap/ScrollToPlugin'
+import { DrawSVGPlugin } from 'gsap/DrawSVGPlugin'
+import { MotionPathPlugin } from 'gsap/MotionPathPlugin'
 
-gsap.registerPlugin(useGSAP, ScrollTrigger, ScrollSmoother, SplitText, ScrollToPlugin)
+gsap.registerPlugin(useGSAP, ScrollTrigger, ScrollSmoother, SplitText, ScrollToPlugin, DrawSVGPlugin, MotionPathPlugin)
 
 gsap.defaults({ ease: 'power3.out', duration: 1 })
 

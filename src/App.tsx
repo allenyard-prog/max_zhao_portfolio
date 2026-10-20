@@ -7,6 +7,7 @@ import Hero from './components/Hero'
 import Marquee from './components/Marquee'
 import About from './components/About'
 import Experience from './components/Experience'
+import Architecture from './components/Architecture'
 import Work from './components/Work'
 import Skills from './components/Skills'
 import Contact from './components/Contact'
@@ -71,6 +72,7 @@ export default function App() {
             <Marquee />
             <About />
             <Experience />
+            <Architecture />
             <Work />
             <Skills />
             <Contact onNavigate={scrollTo} />

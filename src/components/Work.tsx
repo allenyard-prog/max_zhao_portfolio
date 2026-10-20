@@ -1,6 +1,7 @@
 import { useRef } from 'react'
 import { gsap, useGSAP } from '../lib/gsap'
 import { projects, profile } from '../data/content'
+import { CompanyMark } from './BrandIcon'
 
 export default function Work() {
   const root = useRef<HTMLElement>(null)
@@ -102,7 +103,7 @@ export default function Work() {
       <div className="work__pin">
         <div className="work__header">
           <div>
-            <span className="eyebrow">03 — Selected work</span>
+            <span className="eyebrow">04 — Selected work</span>
             <h2 className="h2" style={{ marginTop: '1rem' }}>
               Systems that <em className="grad-text">move money</em>
             </h2>
@@ -124,7 +125,10 @@ export default function Work() {
               <div className="card__orb" aria-hidden="true" />
               <div className="card__top">
                 <span className="card__index">{p.index}</span>
-                <span className="card__company">{p.company}</span>
+                <span className="card__company">
+                  <CompanyMark company={p.company} size={16} />
+                  {p.company}
+                </span>
               </div>
               <div className="card__body">
                 <span className="card__cat">{p.category}</span>
